@@ -1,0 +1,48 @@
+# systemd unit for the MCP server.  Install with:
+#   sudo cp deploy/skill-router.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now skill-router
+#
+# Edit User/WorkingDirectory/ExecStart to match your checkout.  Secrets go in
+# /etc/skill-router.env (mode 0600), never in this file — a unit file is
+# world-readable and shows up in `systemctl cat`.
+
+[Unit]
+Description=skill-router MCP server
+Documentation=https://github.com/pi314x/skill-router/blob/main/docs/MCP_SERVER.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=skillrouter
+Group=skillrouter
+WorkingDirectory=/opt/skill-router
+EnvironmentFile=-/etc/skill-router.env
+ExecStart=/opt/skill-router/.venv/bin/python skill_server.py \
+    --host 127.0.0.1 --port 8001 --transport streamable-http
+Restart=on-failure
+RestartSec=5s
+
+# The server only reads. Everything below enforces that at the kernel rather than
+# trusting the code — a read-only tool surface should be a read-only process.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skill-router
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,56 @@
+# skill-router — Streamable HTTP MCP server at /mcp.
+#
+# The endpoint, capabilities and instructions are configuration; the tools themselves
+# are discovered by annotation scanning (any @McpTool method on a bean), so this file
+# is where the server's identity and transport live, not its behaviour.
+spring:
+  application:
+    name: skill-router
+  ai:
+    mcp:
+      server:
+        name: skill-router
+        version: 1.0.0
+        # sync: the tools are plain blocking methods reading local Markdown. Nothing to
+        # gain from the reactive path, and a debugger step-through to lose.
+        type: sync
+        protocol: streamable
+        streamable-http:
+          mcp-endpoint: /mcp
+        capabilities:
+          tool: true
+          resource: true
+          prompt: true
+          completion: false
+        instructions: >
+          This server holds PROCEDURES, not capabilities. Before acting on anything beyond a
+          single lookup, call route_skill(task) (or list_skills) to find the procedure that
+          fits, then get_skill(name) to load it, then follow it using the tools your other
+          connected servers provide — the skill names them, this server does not serve them.
+          If route_skill returns no match, say so and work with the raw tools rather than
+          forcing the closest procedure onto the task.
+
+server:
+  # 8002 so it can run beside the Python server on 8001 without a clash.
+  port: ${MCP_PORT:8002}
+  # Loopback by default. Publishing means a reverse proxy with TLS and auth in front —
+  # see ../docs/MCP_SERVER.md.
+  address: ${MCP_HOST:127.0.0.1}
+
+# The catalog to serve. Point this at your own skills/ to reuse the server unchanged.
+skills:
+  dir: ${SKILLS_DIR:../skills}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+logging:
+  level:
+    io.skillrouter: INFO

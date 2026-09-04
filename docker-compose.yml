@@ -1,0 +1,49 @@
+#   docker compose up -d --build
+#   curl localhost:8001/health
+#   npx @modelcontextprotocol/inspector http://localhost:8001/mcp
+#
+# The Java build is a separate profile:
+#   docker compose --profile java up -d --build
+services:
+  skill-router:
+    build: .
+    image: skill-router:1.0.0
+    container_name: skill-router
+    restart: unless-stopped
+    ports:
+      # Loopback on purpose. Change to "8001:8001" only behind a reverse proxy that
+      # terminates TLS and enforces auth — see docs/MCP_SERVER.md.
+      - "127.0.0.1:8001:8001"
+    environment:
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8001"
+      SKILLS_DIR: "/skills"
+      # The Host/Origin allow-lists. A value missing here is rejected, which is the
+      # DNS-rebinding protection working.
+      MCP_ALLOWED_HOSTS: "${MCP_ALLOWED_HOSTS:-127.0.0.1:8001,localhost:8001}"
+      MCP_ALLOWED_ORIGINS: "${MCP_ALLOWED_ORIGINS:-http://127.0.0.1:8001,http://localhost:8001}"
+      # Set to require Authorization: Bearer <token>. Empty means loopback only.
+      MCP_TOKEN: "${MCP_TOKEN:-}"
+      MCP_LOG_LEVEL: "${MCP_LOG_LEVEL:-INFO}"
+    volumes:
+      # Edit a skill and restart — no rebuild. Read-only: the server only ever reads.
+      - ./skills:/skills:ro
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp"]
+
+  skill-router-java:
+    profiles: ["java"]
+    build: ./java-mcp-server
+    image: skill-router-java:1.0.0
+    container_name: skill-router-java
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8002:8002"
+    environment:
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8002"
+      SKILLS_DIR: "/skills"
+    volumes:
+      - ./skills:/skills:ro
+    security_opt: ["no-new-privileges:true"]

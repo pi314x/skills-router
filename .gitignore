@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/
+.DS_Store
+
+# Java build output / Eclipse metadata
+java-mcp-server/target/
+java-mcp-server/.classpath
+java-mcp-server/.project
+java-mcp-server/.settings/

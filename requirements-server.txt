@@ -1,0 +1,14 @@
+# MCP server + skill routing.  The detection/research stack (pandas, scikit-learn,
+# TA-Lib, ...) is NOT here — see README "Install".  This file is what the server
+# container needs, and nothing more: a smaller image, and a build that does not fail
+# on TA-Lib's C library just to serve a JSON tool list.
+
+mcp>=2.1,<3            # MCP Python SDK 2.x — MCPServer, tool annotations, structured
+                       # output.  1.x is NOT compatible: FastMCP was renamed and the
+                       # client entry points changed.  See docs/MCP_SERVER.md.
+uvicorn>=0.30          # ASGI server for the HTTP transports
+python-dotenv>=1.0     # .env loading, same as the rest of the toolkit
+
+# Providers for llm_router.py — optional, only if you use ./run.sh ask
+anthropic>=0.40
+openai>=1.40
