@@ -44,6 +44,7 @@ here that spends money, so it stays off until you opt in.
     python llm_router.py --mcp-url http://127.0.0.1:8001/mcp \
                          --mcp-url http://127.0.0.1:9000/mcp "..."   # + a domain server
     python llm_router.py --provider openai --routing prefilter "..."
+    python llm_router.py --provider openrouter "..."   # OPENROUTER_API_KEY; any model OpenRouter serves
 """
 
 from __future__ import annotations
@@ -65,6 +66,8 @@ DEFAULT_MCP_URLS = [u.strip() for u in
 MCP_TOKEN = os.getenv("MCP_TOKEN", "").strip()
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
 # The skill-routing tools are meta: they describe the catalog rather than the market.
 # Kept out of any deferred-loading set, because they are the entry point to everything
@@ -364,12 +367,17 @@ async def run_claude_connector(mcp_urls: List[str], system: str, task: str, *, m
     return f"(stopped after {max_turns} turns without a final answer)"
 
 
-async def run_openai(fleet, specs, system: str, task: str, *, max_turns: int,
-                     verbose: bool) -> str:
-    """The same loop in OpenAI's shapes: tool_calls out, role='tool' messages back."""
+async def run_openai(fleet, specs, system: str, task: str, *, max_turns: int, verbose: bool,
+                     model: Optional[str] = None, base_url: Optional[str] = None,
+                     api_key: Optional[str] = None) -> str:
+    """The same loop in OpenAI's shapes: tool_calls out, role='tool' messages back.
+
+    Also drives OpenRouter, which speaks the identical Chat Completions API — only
+    the base URL, API key and model string differ, so there is nothing OpenRouter-
+    specific to write beyond `run_openrouter` supplying those three."""
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI()
+    client = AsyncOpenAI(base_url=base_url, api_key=api_key)
     tools = to_openai_tools(specs)
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": system},
@@ -377,7 +385,7 @@ async def run_openai(fleet, specs, system: str, task: str, *, max_turns: int,
     ]
     for turn in range(max_turns):
         resp = await client.chat.completions.create(
-            model=OPENAI_MODEL, messages=messages, tools=tools,
+            model=model or OPENAI_MODEL, messages=messages, tools=tools,
         )
         msg = resp.choices[0].message
         if not msg.tool_calls:
@@ -398,6 +406,20 @@ async def run_openai(fleet, specs, system: str, task: str, *, max_turns: int,
     return f"(stopped after {max_turns} turns without a final answer)"
 
 
+async def run_openrouter(fleet, specs, system: str, task: str, *, max_turns: int,
+                         verbose: bool) -> str:
+    """OpenRouter over the OpenAI Chat Completions shape — one gateway, many models.
+
+    `OPENROUTER_MODEL` picks which upstream model OpenRouter routes the request to
+    (e.g. `anthropic/claude-opus-5`, `openai/gpt-4o-mini`, `meta-llama/llama-3.1-70b-
+    instruct`) — see https://openrouter.ai/models for the full catalog."""
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        raise SystemExit("--provider openrouter needs OPENROUTER_API_KEY set")
+    return await run_openai(fleet, specs, system, task, max_turns=max_turns, verbose=verbose,
+                            model=OPENROUTER_MODEL, base_url=OPENROUTER_BASE_URL, api_key=api_key)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -409,6 +431,8 @@ def pick_provider(explicit: Optional[str]) -> str:
         return "claude"
     if os.getenv("OPENAI_API_KEY"):
         return "openai"
+    if os.getenv("OPENROUTER_API_KEY"):
+        return "openrouter"
     return "claude"
 
 
@@ -443,6 +467,9 @@ async def run(args: argparse.Namespace) -> int:
             answer = await run_claude(fleet, fleet.specs, system, args.task,
                                       max_turns=args.max_turns,
                                       tool_search=args.tool_search, verbose=args.verbose)
+        elif provider == "openrouter":
+            answer = await run_openrouter(fleet, fleet.specs, system, args.task,
+                                          max_turns=args.max_turns, verbose=args.verbose)
         else:
             answer = await run_openai(fleet, fleet.specs, system, args.task,
                                       max_turns=args.max_turns, verbose=args.verbose)
@@ -473,8 +500,8 @@ def main() -> int:
         description="Drive a skill-router catalog (plus any domain MCP servers) "
                     "from Claude or OpenAI.")
     ap.add_argument("task", help="what you want done, in plain language")
-    ap.add_argument("--provider", choices=("claude", "openai"),
-                    help="default: whichever API key is set (ANTHROPIC first)")
+    ap.add_argument("--provider", choices=("claude", "openai", "openrouter"),
+                    help="default: whichever API key is set (ANTHROPIC, then OPENAI, then OPENROUTER)")
     ap.add_argument("--mode", choices=("local", "connector"), default="local",
                     help="local: we run the MCP client + tool loop.  connector: Claude connects to the MCP URL itself")
     ap.add_argument("--routing", choices=("model", "prefilter", "none"), default="model",
