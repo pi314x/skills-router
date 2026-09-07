@@ -134,6 +134,19 @@ its own OpenAI-compatibility endpoint) — `run_openai` drives all three, each p
 just supplying its own base URL, API key and model string, so there is no
 provider-specific request/response translation to write or test beyond that.
 
+`--verbose` reports what the run actually cost, per turn and as a total, so the
+tiers above can be compared rather than asserted:
+
+```
+  [0] tokens in=1204 out=88
+  [1] tokens in=1613 out=142
+tokens: in=2817 out=230 total=3047 turns=2 routing=prefilter
+```
+
+It goes to stderr — stdout still carries only the answer. Anthropic reports cache
+hits outside `input_tokens`, so those are added back in: `in=` is the size of the
+prompt that was actually sent, which is the number the tiers are arguing about.
+
 ## Java build
 
 [`java-mcp-server/`](java-mcp-server/README.md) is the same server on Spring Boot 4.1

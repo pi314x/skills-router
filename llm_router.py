@@ -297,7 +297,52 @@ def to_openai_tools(specs: List[ToolSpec]) -> List[Dict[str, Any]]:
     ]
 
 
-async def run_claude(fleet, specs, system: str, task: str, *, max_turns: int,
+def token_counts(usage) -> Tuple[int, int]:
+    """(input, output) from whatever usage object a provider returned.
+
+    Anthropic counts cache hits separately from `input_tokens`, so they are added
+    back: all three are prompt tokens that were sent, which is the number a
+    routing-cost comparison is about.  The OpenAI shape already folds them into
+    `prompt_tokens`.  A gateway that reports no usage at all — some do — counts as
+    zero rather than failing a run that otherwise succeeded."""
+    if usage is None:
+        return 0, 0
+
+    def field(name: str) -> int:
+        return int(getattr(usage, name, 0) or 0)
+
+    if getattr(usage, "prompt_tokens", None) is not None:
+        return field("prompt_tokens"), field("completion_tokens")
+    return (field("input_tokens") + field("cache_read_input_tokens")
+            + field("cache_creation_input_tokens")), field("output_tokens")
+
+
+class Usage:
+    """What a run spent, accumulated across turns and providers.
+
+    The point of the three routing strategies is that they cost different amounts
+    of context; without a counter that claim is untested folklore, so every loop
+    below records each response here and `run()` prints the total."""
+
+    __slots__ = ("input", "output", "turns")
+
+    def __init__(self) -> None:
+        self.input = self.output = self.turns = 0
+
+    def record(self, resp, turn: int, verbose: bool) -> None:
+        got_in, got_out = token_counts(getattr(resp, "usage", None))
+        self.input += got_in
+        self.output += got_out
+        self.turns += 1
+        if verbose:
+            print(f"  [{turn}] tokens in={got_in} out={got_out}", file=sys.stderr)
+
+    def report(self, routing: str) -> str:
+        return (f"tokens: in={self.input} out={self.output} "
+                f"total={self.input + self.output} turns={self.turns} routing={routing}")
+
+
+async def run_claude(fleet, specs, system: str, task: str, *, usage: Usage, max_turns: int,
                      tool_search: bool, verbose: bool) -> str:
     """Manual agentic loop on the Messages API (we own the MCP transport)."""
     from anthropic import AsyncAnthropic
@@ -319,6 +364,8 @@ async def run_claude(fleet, specs, system: str, task: str, *, max_turns: int,
             thinking={"type": "adaptive"},
             messages=messages,
         )
+        # Before the pause_turn check: a paused turn was still generated and billed.
+        usage.record(resp, turn, verbose)
         if resp.stop_reason == "pause_turn":
             # A server-side tool ran long; re-send to let it continue.
             messages.append({"role": "assistant", "content": resp.content})
@@ -342,8 +389,8 @@ async def run_claude(fleet, specs, system: str, task: str, *, max_turns: int,
     return f"(stopped after {max_turns} turns without a final answer)"
 
 
-async def run_claude_connector(mcp_urls: List[str], system: str, task: str, *, max_turns: int,
-                               tool_search: bool, verbose: bool) -> str:
+async def run_claude_connector(mcp_urls: List[str], system: str, task: str, *, usage: Usage,
+                               max_turns: int, tool_search: bool, verbose: bool) -> str:
     """No loop, no MCP client: Claude connects to the MCP servers itself.
 
     Two things bite here. `mcp_servers` alone is a validation error — the matching
@@ -360,7 +407,7 @@ async def run_claude_connector(mcp_urls: List[str], system: str, task: str, *, m
         tools.append({"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"})
 
     messages: List[Dict[str, Any]] = [{"role": "user", "content": task}]
-    for _ in range(max_turns):
+    for turn in range(max_turns):
         resp = await client.beta.messages.create(
             betas=["mcp-client-2025-11-20"],
             model=CLAUDE_MODEL,
@@ -371,6 +418,7 @@ async def run_claude_connector(mcp_urls: List[str], system: str, task: str, *, m
             thinking={"type": "adaptive"},
             messages=messages,
         )
+        usage.record(resp, turn, verbose)
         text = "".join(b.text for b in resp.content if b.type == "text")
         if resp.stop_reason != "pause_turn":
             return text
@@ -380,8 +428,8 @@ async def run_claude_connector(mcp_urls: List[str], system: str, task: str, *, m
     return f"(stopped after {max_turns} turns without a final answer)"
 
 
-async def run_openai(fleet, specs, system: str, task: str, *, max_turns: int, verbose: bool,
-                     model: Optional[str] = None, base_url: Optional[str] = None,
+async def run_openai(fleet, specs, system: str, task: str, *, usage: Usage, max_turns: int,
+                     verbose: bool, model: Optional[str] = None, base_url: Optional[str] = None,
                      api_key: Optional[str] = None) -> str:
     """The same loop in OpenAI's shapes: tool_calls out, role='tool' messages back.
 
@@ -400,6 +448,7 @@ async def run_openai(fleet, specs, system: str, task: str, *, max_turns: int, ve
         resp = await client.chat.completions.create(
             model=model or OPENAI_MODEL, messages=messages, tools=tools,
         )
+        usage.record(resp, turn, verbose)
         msg = resp.choices[0].message
         if not msg.tool_calls:
             return msg.content or ""
@@ -419,26 +468,26 @@ async def run_openai(fleet, specs, system: str, task: str, *, max_turns: int, ve
     return f"(stopped after {max_turns} turns without a final answer)"
 
 
-async def run_openrouter(fleet, specs, system: str, task: str, *, max_turns: int,
+async def run_openrouter(fleet, specs, system: str, task: str, *, usage: Usage, max_turns: int,
                          verbose: bool) -> str:
     """OpenRouter over the OpenAI Chat Completions shape — one gateway, many models.
 
     `OPENROUTER_MODEL` picks which upstream model OpenRouter routes the request to
     (e.g. `anthropic/claude-opus-5`, `openai/gpt-4o-mini`, `meta-llama/llama-3.1-70b-
     instruct`) — see https://openrouter.ai/models for the full catalog."""
-    return await run_openai(fleet, specs, system, task, max_turns=max_turns, verbose=verbose,
-                            model=OPENROUTER_MODEL, base_url=OPENROUTER_BASE_URL,
-                            api_key=api_key_for("openrouter"))
+    return await run_openai(fleet, specs, system, task, usage=usage, max_turns=max_turns,
+                            verbose=verbose, model=OPENROUTER_MODEL,
+                            base_url=OPENROUTER_BASE_URL, api_key=api_key_for("openrouter"))
 
 
-async def run_gemini(fleet, specs, system: str, task: str, *, max_turns: int,
+async def run_gemini(fleet, specs, system: str, task: str, *, usage: Usage, max_turns: int,
                      verbose: bool) -> str:
     """Gemini over its OpenAI-compatible endpoint — same reuse of run_openai as
     OpenRouter above. See https://ai.google.dev/gemini-api/docs/openai for the
     compatibility layer and https://ai.google.dev/gemini-api/docs/models for model
     names (`GEMINI_MODEL`, e.g. `gemini-flash-latest`, `gemini-2.5-pro`)."""
-    return await run_openai(fleet, specs, system, task, max_turns=max_turns, verbose=verbose,
-                            model=GEMINI_MODEL, base_url=GEMINI_BASE_URL,
+    return await run_openai(fleet, specs, system, task, usage=usage, max_turns=max_turns,
+                            verbose=verbose, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL,
                             api_key=api_key_for("gemini"))
 
 
@@ -463,6 +512,7 @@ def pick_provider(explicit: Optional[str]) -> str:
 async def run(args: argparse.Namespace) -> int:
     provider = pick_provider(args.provider)
     urls: List[str] = args.mcp_url or DEFAULT_MCP_URLS
+    usage = Usage()
 
     if provider == "claude" and args.mode == "connector":
         # Nothing local to drive: the API is the MCP client. We still need the skill
@@ -470,8 +520,10 @@ async def run(args: argparse.Namespace) -> int:
         async with connect(urls) as fleet:
             system, _ = await build_system_prompt(fleet, args.task, args.routing)
         answer = await run_claude_connector(
-            urls, system, args.task,
+            urls, system, args.task, usage=usage,
             max_turns=args.max_turns, tool_search=args.tool_search, verbose=args.verbose)
+        if args.verbose:
+            print(usage.report(args.routing), file=sys.stderr)
         print(answer)
         return 0
 
@@ -488,18 +540,20 @@ async def run(args: argparse.Namespace) -> int:
             print(f"warning: tool {name!r} served by more than one server — "
                   f"the first one listed wins", file=sys.stderr)
         if provider == "claude":
-            answer = await run_claude(fleet, fleet.specs, system, args.task,
+            answer = await run_claude(fleet, fleet.specs, system, args.task, usage=usage,
                                       max_turns=args.max_turns,
                                       tool_search=args.tool_search, verbose=args.verbose)
         elif provider == "openrouter":
-            answer = await run_openrouter(fleet, fleet.specs, system, args.task,
+            answer = await run_openrouter(fleet, fleet.specs, system, args.task, usage=usage,
                                           max_turns=args.max_turns, verbose=args.verbose)
         elif provider == "gemini":
-            answer = await run_gemini(fleet, fleet.specs, system, args.task,
+            answer = await run_gemini(fleet, fleet.specs, system, args.task, usage=usage,
                                       max_turns=args.max_turns, verbose=args.verbose)
         else:
-            answer = await run_openai(fleet, fleet.specs, system, args.task,
+            answer = await run_openai(fleet, fleet.specs, system, args.task, usage=usage,
                                       max_turns=args.max_turns, verbose=args.verbose)
+    if args.verbose:
+        print(usage.report(args.routing), file=sys.stderr)
     print(answer)
     return 0
 

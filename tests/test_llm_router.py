@@ -115,6 +115,55 @@ def test_tool_spec_defaults_when_empty():
     assert spec.schema == {"type": "object", "properties": {}}
 
 
+# ----------------------------------------------------------------- token accounting
+
+def test_token_counts_reads_the_openai_shape():
+    usage = SimpleNamespace(prompt_tokens=1204, completion_tokens=88, total_tokens=1292)
+    assert lr.token_counts(usage) == (1204, 88)
+
+
+def test_token_counts_reads_the_anthropic_shape():
+    usage = SimpleNamespace(input_tokens=900, output_tokens=88,
+                            cache_read_input_tokens=0, cache_creation_input_tokens=0)
+    assert lr.token_counts(usage) == (900, 88)
+
+
+def test_token_counts_adds_anthropic_cache_tokens_to_input():
+    """Anthropic reports cache hits outside input_tokens.
+
+    Left out, a cached run looks far cheaper than the prompt it actually sent —
+    which would invert the very comparison this counter exists to make."""
+    usage = SimpleNamespace(input_tokens=100, output_tokens=20,
+                            cache_read_input_tokens=4000, cache_creation_input_tokens=50)
+    assert lr.token_counts(usage) == (4150, 20)
+
+
+def test_token_counts_survives_a_provider_that_reports_nothing():
+    """Some gateways omit usage entirely — that is not a reason to fail a good run."""
+    assert lr.token_counts(None) == (0, 0)
+    assert lr.token_counts(SimpleNamespace()) == (0, 0)
+    assert lr.token_counts(SimpleNamespace(prompt_tokens=12, completion_tokens=None)) == (12, 0)
+
+
+def test_usage_accumulates_and_reports():
+    usage = lr.Usage()
+    usage.record(SimpleNamespace(usage=SimpleNamespace(prompt_tokens=100, completion_tokens=10)),
+                 turn=0, verbose=False)
+    usage.record(SimpleNamespace(usage=SimpleNamespace(prompt_tokens=250, completion_tokens=30)),
+                 turn=1, verbose=False)
+    assert (usage.input, usage.output, usage.turns) == (350, 40, 2)
+    assert usage.report("prefilter") == "tokens: in=350 out=40 total=390 turns=2 routing=prefilter"
+
+
+def test_usage_logs_each_turn_only_when_verbose(capsys):
+    usage = lr.Usage()
+    resp = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=7, completion_tokens=3))
+    usage.record(resp, turn=0, verbose=False)
+    assert capsys.readouterr().err == ""
+    usage.record(resp, turn=1, verbose=True)
+    assert "[1] tokens in=7 out=3" in capsys.readouterr().err
+
+
 # ----------------------------------------------------------------- OpenAI-compatible loop
 
 def _fake_openai_client(monkeypatch, recorder, reply="ok"):
@@ -142,7 +191,7 @@ def _fake_openai_client(monkeypatch, recorder, reply="ok"):
 def test_run_openai_uses_default_model_and_no_explicit_base_url(monkeypatch):
     recorder = {}
     _fake_openai_client(monkeypatch, recorder)
-    result = asyncio.run(lr.run_openai(None, [], "sys", "task", max_turns=1, verbose=False))
+    result = asyncio.run(lr.run_openai(None, [], "sys", "task", usage=lr.Usage(), max_turns=1, verbose=False))
     assert result == "ok"
     assert recorder["init_kwargs"] == {"base_url": None, "api_key": None}
     assert recorder["create_kwargs"]["model"] == lr.OPENAI_MODEL
@@ -152,7 +201,7 @@ def test_run_openrouter_targets_openrouter_base_url_and_model(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     recorder = {}
     _fake_openai_client(monkeypatch, recorder)
-    result = asyncio.run(lr.run_openrouter(None, [], "sys", "task", max_turns=1, verbose=False))
+    result = asyncio.run(lr.run_openrouter(None, [], "sys", "task", usage=lr.Usage(), max_turns=1, verbose=False))
     assert result == "ok"
     assert recorder["init_kwargs"] == {"base_url": lr.OPENROUTER_BASE_URL, "api_key": "sk-or-test"}
     assert recorder["create_kwargs"]["model"] == lr.OPENROUTER_MODEL
@@ -163,7 +212,7 @@ def test_run_openrouter_honors_model_override(monkeypatch):
     monkeypatch.setattr(lr, "OPENROUTER_MODEL", "anthropic/claude-opus-5")
     recorder = {}
     _fake_openai_client(monkeypatch, recorder)
-    asyncio.run(lr.run_openrouter(None, [], "sys", "task", max_turns=1, verbose=False))
+    asyncio.run(lr.run_openrouter(None, [], "sys", "task", usage=lr.Usage(), max_turns=1, verbose=False))
     assert recorder["create_kwargs"]["model"] == "anthropic/claude-opus-5"
 
 
@@ -171,7 +220,7 @@ def test_run_gemini_targets_gemini_base_url_and_model(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "gem-test")
     recorder = {}
     _fake_openai_client(monkeypatch, recorder)
-    result = asyncio.run(lr.run_gemini(None, [], "sys", "task", max_turns=1, verbose=False))
+    result = asyncio.run(lr.run_gemini(None, [], "sys", "task", usage=lr.Usage(), max_turns=1, verbose=False))
     assert result == "ok"
     assert recorder["init_kwargs"] == {"base_url": lr.GEMINI_BASE_URL, "api_key": "gem-test"}
     assert recorder["create_kwargs"]["model"] == lr.GEMINI_MODEL
@@ -182,7 +231,7 @@ def test_run_gemini_honors_model_override(monkeypatch):
     monkeypatch.setattr(lr, "GEMINI_MODEL", "gemini-2.5-pro")
     recorder = {}
     _fake_openai_client(monkeypatch, recorder)
-    asyncio.run(lr.run_gemini(None, [], "sys", "task", max_turns=1, verbose=False))
+    asyncio.run(lr.run_gemini(None, [], "sys", "task", usage=lr.Usage(), max_turns=1, verbose=False))
     assert recorder["create_kwargs"]["model"] == "gemini-2.5-pro"
 
 
@@ -212,7 +261,10 @@ def test_run_openai_forwards_tool_calls_to_the_fleet(monkeypatch):
                 )
             else:
                 message = SimpleNamespace(content="done", tool_calls=None)
-            return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=message)],
+                usage=SimpleNamespace(prompt_tokens=100 * turns["n"], completion_tokens=10),
+            )
 
     class FakeChat:
         def __init__(self):
@@ -223,9 +275,48 @@ def test_run_openai_forwards_tool_calls_to_the_fleet(monkeypatch):
             self.chat = FakeChat()
 
     monkeypatch.setattr("openai.AsyncOpenAI", FakeAsyncOpenAI)
-    result = asyncio.run(lr.run_openai(FakeFleet(), [], "sys", "task", max_turns=3, verbose=False))
+    usage = lr.Usage()
+    result = asyncio.run(lr.run_openai(FakeFleet(), [], "sys", "task", usage=usage,
+                                       max_turns=3, verbose=False))
     assert result == "done"
     assert calls == [("get_skill", {"name": "triage-alert"})]
+    # Every turn counts, the tool-calling one included — not just the turn that answered.
+    assert (usage.input, usage.output, usage.turns) == (300, 20, 2)
+
+
+# ----------------------------------------------------------------- Claude loop
+
+def test_run_claude_counts_a_paused_turn(monkeypatch):
+    """A pause_turn response was generated and billed before we resend.
+
+    Counting it only after the pause check would undercount exactly the runs that
+    lean on server-side tools — the ones most likely to pause."""
+    replies = [
+        SimpleNamespace(stop_reason="pause_turn", content=[],
+                        usage=SimpleNamespace(input_tokens=500, output_tokens=40,
+                                              cache_read_input_tokens=0,
+                                              cache_creation_input_tokens=0)),
+        SimpleNamespace(stop_reason="end_turn",
+                        content=[SimpleNamespace(type="text", text="the answer")],
+                        usage=SimpleNamespace(input_tokens=600, output_tokens=60,
+                                              cache_read_input_tokens=0,
+                                              cache_creation_input_tokens=0)),
+    ]
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            return replies.pop(0)
+
+    class FakeAsyncAnthropic:
+        def __init__(self, **kwargs):
+            self.messages = FakeMessages()
+
+    monkeypatch.setattr("anthropic.AsyncAnthropic", FakeAsyncAnthropic)
+    usage = lr.Usage()
+    result = asyncio.run(lr.run_claude(None, [], "sys", "task", usage=usage,
+                                       max_turns=3, tool_search=False, verbose=False))
+    assert result == "the answer"
+    assert (usage.input, usage.output, usage.turns) == (1100, 100, 2)
 
 
 # ----------------------------------------------------------------- CLI plumbing
@@ -349,3 +440,40 @@ def test_run_dispatches_to_the_right_provider(monkeypatch, capsys, provider, exp
     assert asyncio.run(lr.run(args)) == 0
     assert called == [expected]
     assert capsys.readouterr().out.strip() == "answer"
+
+
+def test_run_reports_the_token_total_when_verbose(monkeypatch, capsys):
+    """The run total is the headline number, so run() must print it once —
+    and only on --verbose, where the rest of the diagnostics already live."""
+    @asynccontextmanager
+    async def fake_connect(urls):
+        yield SimpleNamespace(specs=[], collisions=[], sessions=[])
+
+    async def fake_build_system_prompt(fleet, task, routing):
+        return "sys", None
+
+    async def fake_run_openai(fleet, specs, system, task, *, usage, **_kw):
+        usage.record(SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1204,
+                                                           completion_tokens=88)),
+                     turn=0, verbose=False)
+        return "answer"
+
+    monkeypatch.setattr(lr, "connect", fake_connect)
+    monkeypatch.setattr(lr, "build_system_prompt", fake_build_system_prompt)
+    monkeypatch.setattr(lr, "run_openai", fake_run_openai)
+
+    def call(verbose):
+        args = argparse.Namespace(
+            provider="openai", mode="local", routing="prefilter", task="some task",
+            mcp_url=None, max_turns=1, tool_search=False, verbose=verbose)
+        assert asyncio.run(lr.run(args)) == 0
+        return capsys.readouterr()
+
+    quiet = call(verbose=False)
+    assert "tokens:" not in quiet.err
+    assert quiet.out.strip() == "answer"
+
+    loud = call(verbose=True)
+    assert "tokens: in=1204 out=88 total=1292 turns=1 routing=prefilter" in loud.err
+    # The answer still goes to stdout alone, so `... > answer.txt` stays clean.
+    assert loud.out.strip() == "answer"

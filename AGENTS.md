@@ -46,6 +46,12 @@ regression, not a flaky test.
 - Wire the provider into `pick_provider` (env-var auto-detection) and the
   `--provider` argparse choices, and check whether Claude-only flags
   (`--mode connector`, `--tool-search`) should reject it.
+- A provider needing its own API key belongs in `PROVIDER_KEYS`, so `main()`
+  rejects a missing one before anything connects rather than after an MCP
+  session (and, under `--routing prefilter`, its routing calls) is spent.
+- Every loop must `usage.record(resp, turn, verbose)` on each response, including
+  ones it is about to discard or resend — they were billed. `token_counts`
+  handles both usage shapes; extend it there, not in the loop.
 
 ## Conventions
 
