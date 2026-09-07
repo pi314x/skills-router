@@ -149,7 +149,7 @@ identically.
 | `skills/*.md` | The catalog. Data, not code |
 | `skills.py` | Loader, validator, index, lexical router. **Stdlib only** — no MCP, no provider, no network |
 | `skill_server.py` | The MCP server (Python SDK 2.x): 3 tools, `skill://` resources, a `use_skill` prompt |
-| `llm_router.py` | Reference client — Claude or OpenAI, three routing strategies, many servers |
+| `llm_router.py` | Reference client — Claude, OpenAI, OpenRouter or Gemini, three routing strategies, many servers |
 | `java-mcp-server/` | The same server in Java/Spring Boot |
 | `tests/test_skills.py` | Offline. The six routing cases are acceptance criteria |
 | `docs/MCP_SERVER.md` | Transports, auth, TLS, Docker/systemd, per-client config |

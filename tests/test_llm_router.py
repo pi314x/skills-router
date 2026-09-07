@@ -7,8 +7,9 @@ is the only thing that can silently break when a new provider is bolted on. Actu
 prompt/response quality is out of scope here; USE_AI gates that behind real money.
 """
 
+import argparse
 import asyncio
-import os
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -166,12 +167,6 @@ def test_run_openrouter_honors_model_override(monkeypatch):
     assert recorder["create_kwargs"]["model"] == "anthropic/claude-opus-5"
 
 
-def test_run_openrouter_requires_api_key(monkeypatch):
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-    with pytest.raises(SystemExit):
-        asyncio.run(lr.run_openrouter(None, [], "sys", "task", max_turns=1, verbose=False))
-
-
 def test_run_gemini_targets_gemini_base_url_and_model(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "gem-test")
     recorder = {}
@@ -189,12 +184,6 @@ def test_run_gemini_honors_model_override(monkeypatch):
     _fake_openai_client(monkeypatch, recorder)
     asyncio.run(lr.run_gemini(None, [], "sys", "task", max_turns=1, verbose=False))
     assert recorder["create_kwargs"]["model"] == "gemini-2.5-pro"
-
-
-def test_run_gemini_requires_api_key(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    with pytest.raises(SystemExit):
-        asyncio.run(lr.run_gemini(None, [], "sys", "task", max_turns=1, verbose=False))
 
 
 def test_run_openai_forwards_tool_calls_to_the_fleet(monkeypatch):
@@ -253,21 +242,110 @@ def test_provider_flag_accepts_new_providers(monkeypatch, capsys, provider):
     assert "USE_AI" in capsys.readouterr().err
 
 
-def test_tool_search_flag_rejected_for_openrouter(monkeypatch, capsys):
+def _no_dial_out(monkeypatch):
+    """Trip-wire for the USE_AI=true tests below.
+
+    They exercise guards that are supposed to reject *before* main() reaches
+    asyncio.run.  Should a guard ever regress, main() would connect to
+    DEFAULT_MCP_URLS and — with a key in the environment — bill a real call.
+    Failing the test is the correct outcome there, not dialing out."""
+    def boom(*_a, **_kw):
+        raise AssertionError("main() proceeded past its guards into asyncio.run")
+
+    monkeypatch.setattr(lr.asyncio, "run", boom)
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "gemini"])
+def test_tool_search_flag_rejected_for_gateway_providers(monkeypatch, capsys, provider):
     monkeypatch.setenv("USE_AI", "true")
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _clear_provider_env(monkeypatch)
+    _no_dial_out(monkeypatch)
     monkeypatch.setattr(
         "sys.argv",
-        ["llm_router.py", "--provider", "openrouter", "--tool-search", "some task"])
+        ["llm_router.py", "--provider", provider, "--tool-search", "some task"])
     assert lr.main() == 2
     assert "tool-search" in capsys.readouterr().err
 
 
-def test_mode_connector_rejected_for_openrouter(monkeypatch, capsys):
+@pytest.mark.parametrize("provider", ["openrouter", "gemini"])
+def test_mode_connector_rejected_for_gateway_providers(monkeypatch, capsys, provider):
     monkeypatch.setenv("USE_AI", "true")
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    _clear_provider_env(monkeypatch)
+    _no_dial_out(monkeypatch)
     monkeypatch.setattr(
         "sys.argv",
-        ["llm_router.py", "--provider", "openrouter", "--mode", "connector", "some task"])
+        ["llm_router.py", "--provider", provider, "--mode", "connector", "some task"])
     assert lr.main() == 2
     assert "connector" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("provider,env_var", [
+    ("openrouter", "OPENROUTER_API_KEY"),
+    ("gemini", "GEMINI_API_KEY"),
+])
+def test_missing_gateway_key_rejected_before_connecting(monkeypatch, capsys, provider, env_var):
+    """The key check must fire in main(), not deep inside run().
+
+    Checked at the far end of run() it costs an MCP session first, and under
+    --routing prefilter the routing calls that session already spent — and it
+    surfaces as exit 1 behind a 'cannot reach MCP server' error rather than the
+    exit 2 every other config mistake here returns."""
+    monkeypatch.setenv("USE_AI", "true")
+    _clear_provider_env(monkeypatch)
+    _no_dial_out(monkeypatch)
+    monkeypatch.setattr("sys.argv", ["llm_router.py", "--provider", provider, "some task"])
+    assert lr.main() == 2
+    assert env_var in capsys.readouterr().err
+
+
+def test_blank_gateway_key_counts_as_missing(monkeypatch, capsys):
+    """A commented-out .env line left as `OPENROUTER_API_KEY=` is not a key."""
+    monkeypatch.setenv("USE_AI", "true")
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "   ")
+    _no_dial_out(monkeypatch)
+    monkeypatch.setattr("sys.argv", ["llm_router.py", "--provider", "openrouter", "some task"])
+    assert lr.main() == 2
+    assert "OPENROUTER_API_KEY" in capsys.readouterr().err
+
+
+# ----------------------------------------------------------------- run() dispatch
+
+@pytest.mark.parametrize("provider,expected", [
+    ("claude", "run_claude"),
+    ("openai", "run_openai"),
+    ("openrouter", "run_openrouter"),
+    ("gemini", "run_gemini"),
+])
+def test_run_dispatches_to_the_right_provider(monkeypatch, capsys, provider, expected):
+    """Each provider must reach its own runner.
+
+    Without this, dropping a branch from run()'s dispatch chain sends the request
+    to the `else` arm — OpenAI's endpoint, model and key — with every other test
+    still green and only the bill to show for it."""
+    called = []
+
+    @asynccontextmanager
+    async def fake_connect(urls):
+        yield SimpleNamespace(specs=[], collisions=[], sessions=[])
+
+    async def fake_build_system_prompt(fleet, task, routing):
+        return "sys", None
+
+    def recorder(name):
+        async def run_it(*_a, **_kw):
+            called.append(name)
+            return "answer"
+        return run_it
+
+    monkeypatch.setattr(lr, "connect", fake_connect)
+    monkeypatch.setattr(lr, "build_system_prompt", fake_build_system_prompt)
+    for name in ("run_claude", "run_openai", "run_openrouter", "run_gemini"):
+        monkeypatch.setattr(lr, name, recorder(name))
+
+    args = argparse.Namespace(
+        provider=provider, mode="local", routing="model", task="some task",
+        mcp_url=None, max_turns=1, tool_search=False, verbose=False)
+    assert asyncio.run(lr.run(args)) == 0
+    assert called == [expected]
+    assert capsys.readouterr().out.strip() == "answer"

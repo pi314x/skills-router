@@ -1,5 +1,5 @@
 """
-llm_router.py — drive a skill-router catalog from Claude or OpenAI.
+llm_router.py — drive a skill-router catalog from Claude, OpenAI, OpenRouter or Gemini.
 
 The reference client for this project, and the thing that proves the design is
 provider-neutral: MCP is the registry, and the only vendor-specific code is ~40 lines
@@ -72,6 +72,10 @@ OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/ap
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
 
+# Gateways we pass an explicit key to.  Claude and OpenAI are absent on purpose:
+# their SDKs read their own env var and raise their own error when it is missing.
+PROVIDER_KEYS = {"openrouter": "OPENROUTER_API_KEY", "gemini": "GEMINI_API_KEY"}
+
 # The skill-routing tools are meta: they describe the catalog rather than the market.
 # Kept out of any deferred-loading set, because they are the entry point to everything
 # else — defer them and the model has no way to discover that skills exist.
@@ -92,6 +96,12 @@ def ai_enabled() -> bool:
     Everything else in this project is free and offline; this file is the one that
     bills. An explicit flag beats discovering that from an invoice."""
     return os.getenv("USE_AI", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def api_key_for(provider: str) -> str:
+    """The gateway's API key, or '' when unset.  main() rejects the empty case
+    before anything connects, so the run_* wrappers can just read it."""
+    return os.getenv(PROVIDER_KEYS[provider], "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -375,9 +385,9 @@ async def run_openai(fleet, specs, system: str, task: str, *, max_turns: int, ve
                      api_key: Optional[str] = None) -> str:
     """The same loop in OpenAI's shapes: tool_calls out, role='tool' messages back.
 
-    Also drives OpenRouter, which speaks the identical Chat Completions API — only
-    the base URL, API key and model string differ, so there is nothing OpenRouter-
-    specific to write beyond `run_openrouter` supplying those three."""
+    Also drives OpenRouter and Gemini, which speak the identical Chat Completions API
+    — only the base URL, API key and model string differ, so there is nothing
+    provider-specific to write beyond the wrappers supplying those three."""
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(base_url=base_url, api_key=api_key)
@@ -416,11 +426,9 @@ async def run_openrouter(fleet, specs, system: str, task: str, *, max_turns: int
     `OPENROUTER_MODEL` picks which upstream model OpenRouter routes the request to
     (e.g. `anthropic/claude-opus-5`, `openai/gpt-4o-mini`, `meta-llama/llama-3.1-70b-
     instruct`) — see https://openrouter.ai/models for the full catalog."""
-    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not api_key:
-        raise SystemExit("--provider openrouter needs OPENROUTER_API_KEY set")
     return await run_openai(fleet, specs, system, task, max_turns=max_turns, verbose=verbose,
-                            model=OPENROUTER_MODEL, base_url=OPENROUTER_BASE_URL, api_key=api_key)
+                            model=OPENROUTER_MODEL, base_url=OPENROUTER_BASE_URL,
+                            api_key=api_key_for("openrouter"))
 
 
 async def run_gemini(fleet, specs, system: str, task: str, *, max_turns: int,
@@ -429,11 +437,9 @@ async def run_gemini(fleet, specs, system: str, task: str, *, max_turns: int,
     OpenRouter above. See https://ai.google.dev/gemini-api/docs/openai for the
     compatibility layer and https://ai.google.dev/gemini-api/docs/models for model
     names (`GEMINI_MODEL`, e.g. `gemini-flash-latest`, `gemini-2.5-pro`)."""
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise SystemExit("--provider gemini needs GEMINI_API_KEY set")
     return await run_openai(fleet, specs, system, task, max_turns=max_turns, verbose=verbose,
-                            model=GEMINI_MODEL, base_url=GEMINI_BASE_URL, api_key=api_key)
+                            model=GEMINI_MODEL, base_url=GEMINI_BASE_URL,
+                            api_key=api_key_for("gemini"))
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +525,7 @@ async def connect(urls: List[str]):
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Drive a skill-router catalog (plus any domain MCP servers) "
-                    "from Claude or OpenAI.")
+                    "from Claude, OpenAI, OpenRouter or Gemini.")
     ap.add_argument("task", help="what you want done, in plain language")
     ap.add_argument("--provider", choices=("claude", "openai", "openrouter", "gemini"),
                     help="default: whichever API key is set (ANTHROPIC, then OPENAI, "
@@ -541,11 +547,17 @@ def main() -> int:
         print("USE_AI is not true — refusing to call an LLM.  Set USE_AI=true to opt in "
               "(this is the only script here that spends money).", file=sys.stderr)
         return 2
-    if args.mode == "connector" and pick_provider(args.provider) != "claude":
+    provider = pick_provider(args.provider)
+    if args.mode == "connector" and provider != "claude":
         print("--mode connector is Claude-only; OpenAI needs --mode local.", file=sys.stderr)
         return 2
-    if args.tool_search and pick_provider(args.provider) != "claude":
+    if args.tool_search and provider != "claude":
         print("--tool-search is Claude-only (server-side tool search).", file=sys.stderr)
+        return 2
+    # Before connecting, not after: a key missing at the far end of run() costs an MCP
+    # session and, under --routing prefilter, the routing calls it already spent.
+    if provider in PROVIDER_KEYS and not api_key_for(provider):
+        print(f"--provider {provider} needs {PROVIDER_KEYS[provider]} set", file=sys.stderr)
         return 2
 
     try:
