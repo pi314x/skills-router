@@ -1,5 +1,5 @@
 """
-llm_router.py — drive a skill-router catalog from Claude or OpenAI.
+llm_router.py — drive a skill-router catalog from Claude, OpenAI, OpenRouter or Gemini.
 
 The reference client for this project, and the thing that proves the design is
 provider-neutral: MCP is the registry, and the only vendor-specific code is ~40 lines
@@ -26,6 +26,10 @@ Three routing strategies (`--routing`), cheapest first:
              default, and the one that scales as the catalog grows.
   none       Raw tools, no skills. The baseline to compare the others against.
 
+`--compare-routing` runs the same task under all three, same fleet and provider, and
+prints a token table so you don't have to run it three times by hand and eyeball
+the difference.
+
 Two Claude-only transports worth knowing about (`--mode`):
 
   local      We are the MCP client and run the tool loop ourselves. Works on both
@@ -44,6 +48,9 @@ here that spends money, so it stays off until you opt in.
     python llm_router.py --mcp-url http://127.0.0.1:8001/mcp \
                          --mcp-url http://127.0.0.1:9000/mcp "..."   # + a domain server
     python llm_router.py --provider openai --routing prefilter "..."
+    python llm_router.py --provider openrouter "..."   # OPENROUTER_API_KEY; any model OpenRouter serves
+    python llm_router.py --compare-routing "..."       # model vs prefilter vs none, one token table
+    python llm_router.py --provider gemini "..."       # GEMINI_API_KEY, via Gemini's OpenAI-compat endpoint
 """
 
 from __future__ import annotations
@@ -65,6 +72,14 @@ DEFAULT_MCP_URLS = [u.strip() for u in
 MCP_TOKEN = os.getenv("MCP_TOKEN", "").strip()
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+
+# Gateways we pass an explicit key to.  Claude and OpenAI are absent on purpose:
+# their SDKs read their own env var and raise their own error when it is missing.
+PROVIDER_KEYS = {"openrouter": "OPENROUTER_API_KEY", "gemini": "GEMINI_API_KEY"}
 
 # The skill-routing tools are meta: they describe the catalog rather than the market.
 # Kept out of any deferred-loading set, because they are the entry point to everything
@@ -86,6 +101,12 @@ def ai_enabled() -> bool:
     Everything else in this project is free and offline; this file is the one that
     bills. An explicit flag beats discovering that from an invoice."""
     return os.getenv("USE_AI", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def api_key_for(provider: str) -> str:
+    """The gateway's API key, or '' when unset.  main() rejects the empty case
+    before anything connects, so the run_* wrappers can just read it."""
+    return os.getenv(PROVIDER_KEYS[provider], "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +302,52 @@ def to_openai_tools(specs: List[ToolSpec]) -> List[Dict[str, Any]]:
     ]
 
 
-async def run_claude(fleet, specs, system: str, task: str, *, max_turns: int,
+def token_counts(usage) -> Tuple[int, int]:
+    """(input, output) from whatever usage object a provider returned.
+
+    Anthropic counts cache hits separately from `input_tokens`, so they are added
+    back: all three are prompt tokens that were sent, which is the number a
+    routing-cost comparison is about.  The OpenAI shape already folds them into
+    `prompt_tokens`.  A gateway that reports no usage at all — some do — counts as
+    zero rather than failing a run that otherwise succeeded."""
+    if usage is None:
+        return 0, 0
+
+    def field(name: str) -> int:
+        return int(getattr(usage, name, 0) or 0)
+
+    if getattr(usage, "prompt_tokens", None) is not None:
+        return field("prompt_tokens"), field("completion_tokens")
+    return (field("input_tokens") + field("cache_read_input_tokens")
+            + field("cache_creation_input_tokens")), field("output_tokens")
+
+
+class Usage:
+    """What a run spent, accumulated across turns and providers.
+
+    The point of the three routing strategies is that they cost different amounts
+    of context; without a counter that claim is untested folklore, so every loop
+    below records each response here and `run()` prints the total."""
+
+    __slots__ = ("input", "output", "turns")
+
+    def __init__(self) -> None:
+        self.input = self.output = self.turns = 0
+
+    def record(self, resp, turn: int, verbose: bool) -> None:
+        got_in, got_out = token_counts(getattr(resp, "usage", None))
+        self.input += got_in
+        self.output += got_out
+        self.turns += 1
+        if verbose:
+            print(f"  [{turn}] tokens in={got_in} out={got_out}", file=sys.stderr)
+
+    def report(self, routing: str) -> str:
+        return (f"tokens: in={self.input} out={self.output} "
+                f"total={self.input + self.output} turns={self.turns} routing={routing}")
+
+
+async def run_claude(fleet, specs, system: str, task: str, *, usage: Usage, max_turns: int,
                      tool_search: bool, verbose: bool) -> str:
     """Manual agentic loop on the Messages API (we own the MCP transport)."""
     from anthropic import AsyncAnthropic
@@ -303,6 +369,8 @@ async def run_claude(fleet, specs, system: str, task: str, *, max_turns: int,
             thinking={"type": "adaptive"},
             messages=messages,
         )
+        # Before the pause_turn check: a paused turn was still generated and billed.
+        usage.record(resp, turn, verbose)
         if resp.stop_reason == "pause_turn":
             # A server-side tool ran long; re-send to let it continue.
             messages.append({"role": "assistant", "content": resp.content})
@@ -326,8 +394,8 @@ async def run_claude(fleet, specs, system: str, task: str, *, max_turns: int,
     return f"(stopped after {max_turns} turns without a final answer)"
 
 
-async def run_claude_connector(mcp_urls: List[str], system: str, task: str, *, max_turns: int,
-                               tool_search: bool, verbose: bool) -> str:
+async def run_claude_connector(mcp_urls: List[str], system: str, task: str, *, usage: Usage,
+                               max_turns: int, tool_search: bool, verbose: bool) -> str:
     """No loop, no MCP client: Claude connects to the MCP servers itself.
 
     Two things bite here. `mcp_servers` alone is a validation error — the matching
@@ -344,7 +412,7 @@ async def run_claude_connector(mcp_urls: List[str], system: str, task: str, *, m
         tools.append({"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"})
 
     messages: List[Dict[str, Any]] = [{"role": "user", "content": task}]
-    for _ in range(max_turns):
+    for turn in range(max_turns):
         resp = await client.beta.messages.create(
             betas=["mcp-client-2025-11-20"],
             model=CLAUDE_MODEL,
@@ -355,6 +423,7 @@ async def run_claude_connector(mcp_urls: List[str], system: str, task: str, *, m
             thinking={"type": "adaptive"},
             messages=messages,
         )
+        usage.record(resp, turn, verbose)
         text = "".join(b.text for b in resp.content if b.type == "text")
         if resp.stop_reason != "pause_turn":
             return text
@@ -364,12 +433,17 @@ async def run_claude_connector(mcp_urls: List[str], system: str, task: str, *, m
     return f"(stopped after {max_turns} turns without a final answer)"
 
 
-async def run_openai(fleet, specs, system: str, task: str, *, max_turns: int,
-                     verbose: bool) -> str:
-    """The same loop in OpenAI's shapes: tool_calls out, role='tool' messages back."""
+async def run_openai(fleet, specs, system: str, task: str, *, usage: Usage, max_turns: int,
+                     verbose: bool, model: Optional[str] = None, base_url: Optional[str] = None,
+                     api_key: Optional[str] = None) -> str:
+    """The same loop in OpenAI's shapes: tool_calls out, role='tool' messages back.
+
+    Also drives OpenRouter and Gemini, which speak the identical Chat Completions API
+    — only the base URL, API key and model string differ, so there is nothing
+    provider-specific to write beyond the wrappers supplying those three."""
     from openai import AsyncOpenAI
 
-    client = AsyncOpenAI()
+    client = AsyncOpenAI(base_url=base_url, api_key=api_key)
     tools = to_openai_tools(specs)
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": system},
@@ -377,8 +451,9 @@ async def run_openai(fleet, specs, system: str, task: str, *, max_turns: int,
     ]
     for turn in range(max_turns):
         resp = await client.chat.completions.create(
-            model=OPENAI_MODEL, messages=messages, tools=tools,
+            model=model or OPENAI_MODEL, messages=messages, tools=tools,
         )
+        usage.record(resp, turn, verbose)
         msg = resp.choices[0].message
         if not msg.tool_calls:
             return msg.content or ""
@@ -398,6 +473,29 @@ async def run_openai(fleet, specs, system: str, task: str, *, max_turns: int,
     return f"(stopped after {max_turns} turns without a final answer)"
 
 
+async def run_openrouter(fleet, specs, system: str, task: str, *, usage: Usage, max_turns: int,
+                         verbose: bool) -> str:
+    """OpenRouter over the OpenAI Chat Completions shape — one gateway, many models.
+
+    `OPENROUTER_MODEL` picks which upstream model OpenRouter routes the request to
+    (e.g. `anthropic/claude-opus-5`, `openai/gpt-4o-mini`, `meta-llama/llama-3.1-70b-
+    instruct`) — see https://openrouter.ai/models for the full catalog."""
+    return await run_openai(fleet, specs, system, task, usage=usage, max_turns=max_turns,
+                            verbose=verbose, model=OPENROUTER_MODEL,
+                            base_url=OPENROUTER_BASE_URL, api_key=api_key_for("openrouter"))
+
+
+async def run_gemini(fleet, specs, system: str, task: str, *, usage: Usage, max_turns: int,
+                     verbose: bool) -> str:
+    """Gemini over its OpenAI-compatible endpoint — same reuse of run_openai as
+    OpenRouter above. See https://ai.google.dev/gemini-api/docs/openai for the
+    compatibility layer and https://ai.google.dev/gemini-api/docs/models for model
+    names (`GEMINI_MODEL`, e.g. `gemini-flash-latest`, `gemini-2.5-pro`)."""
+    return await run_openai(fleet, specs, system, task, usage=usage, max_turns=max_turns,
+                            verbose=verbose, model=GEMINI_MODEL, base_url=GEMINI_BASE_URL,
+                            api_key=api_key_for("gemini"))
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -409,12 +507,66 @@ def pick_provider(explicit: Optional[str]) -> str:
         return "claude"
     if os.getenv("OPENAI_API_KEY"):
         return "openai"
+    if os.getenv("OPENROUTER_API_KEY"):
+        return "openrouter"
+    if os.getenv("GEMINI_API_KEY"):
+        return "gemini"
     return "claude"
+
+
+async def dispatch(provider: str, fleet: "Fleet", system: str, task: str, usage: Usage,
+                   args: argparse.Namespace) -> str:
+    """Route to the one provider loop that matches `provider`.
+
+    The single place that decides which run_* a request reaches — shared by the
+    normal single-strategy run and by run_compare below, so there is exactly one
+    dispatch chain to keep in sync when a provider is added."""
+    if provider == "claude":
+        return await run_claude(fleet, fleet.specs, system, task, usage=usage,
+                                max_turns=args.max_turns, tool_search=args.tool_search,
+                                verbose=args.verbose)
+    if provider == "openrouter":
+        return await run_openrouter(fleet, fleet.specs, system, task, usage=usage,
+                                    max_turns=args.max_turns, verbose=args.verbose)
+    if provider == "gemini":
+        return await run_gemini(fleet, fleet.specs, system, task, usage=usage,
+                                max_turns=args.max_turns, verbose=args.verbose)
+    return await run_openai(fleet, fleet.specs, system, task, usage=usage,
+                            max_turns=args.max_turns, verbose=args.verbose)
+
+
+ROUTING_STRATEGIES = ("model", "prefilter", "none")
+
+
+async def run_compare(provider: str, fleet: "Fleet", args: argparse.Namespace) -> int:
+    """Run the same task under all three routing strategies and total each one.
+
+    Three real LLM calls, not one — `--compare-routing` costs 3x a normal run.  That
+    is the deliberate trade for a same-run, same-fleet, same-task comparison: the
+    numbers line up because nothing else about the request changed between rows."""
+    rows: List[Tuple[str, Usage]] = []
+    for routing in ROUTING_STRATEGIES:
+        system, preloaded = await build_system_prompt(fleet, args.task, routing)
+        usage = Usage()
+        answer = await dispatch(provider, fleet, system, args.task, usage, args)
+        rows.append((routing, usage))
+        print(f"=== routing={routing}" + (f" skill={preloaded}" if preloaded else "") + " ===")
+        print(answer)
+        print()
+
+    header = f"{'routing':<10} {'in':>7} {'out':>7} {'total':>7} {'turns':>6}"
+    print(header)
+    print("-" * len(header))
+    for routing, usage in rows:
+        print(f"{routing:<10} {usage.input:>7} {usage.output:>7} "
+              f"{usage.input + usage.output:>7} {usage.turns:>6}")
+    return 0
 
 
 async def run(args: argparse.Namespace) -> int:
     provider = pick_provider(args.provider)
     urls: List[str] = args.mcp_url or DEFAULT_MCP_URLS
+    usage = Usage()
 
     if provider == "claude" and args.mode == "connector":
         # Nothing local to drive: the API is the MCP client. We still need the skill
@@ -422,30 +574,36 @@ async def run(args: argparse.Namespace) -> int:
         async with connect(urls) as fleet:
             system, _ = await build_system_prompt(fleet, args.task, args.routing)
         answer = await run_claude_connector(
-            urls, system, args.task,
+            urls, system, args.task, usage=usage,
             max_turns=args.max_turns, tool_search=args.tool_search, verbose=args.verbose)
+        if args.verbose:
+            print(usage.report(args.routing), file=sys.stderr)
         print(answer)
         return 0
 
     async with connect(urls) as fleet:
-        system, preloaded = await build_system_prompt(fleet, args.task, args.routing)
         if args.verbose:
             for sess in fleet.sessions:
                 info = sess.server_info
                 print(f"connected {info.name} v{info.version} "
                       f"(protocol {sess.protocol_version})", file=sys.stderr)
-            print(f"provider={provider} tools={len(fleet.specs)} routing={args.routing}"
-                  + (f" skill={preloaded}" if preloaded else ""), file=sys.stderr)
         for name in fleet.collisions:
             print(f"warning: tool {name!r} served by more than one server — "
                   f"the first one listed wins", file=sys.stderr)
-        if provider == "claude":
-            answer = await run_claude(fleet, fleet.specs, system, args.task,
-                                      max_turns=args.max_turns,
-                                      tool_search=args.tool_search, verbose=args.verbose)
-        else:
-            answer = await run_openai(fleet, fleet.specs, system, args.task,
-                                      max_turns=args.max_turns, verbose=args.verbose)
+
+        if args.compare_routing:
+            if args.verbose:
+                print(f"provider={provider} tools={len(fleet.specs)} routing=compare",
+                      file=sys.stderr)
+            return await run_compare(provider, fleet, args)
+
+        system, preloaded = await build_system_prompt(fleet, args.task, args.routing)
+        if args.verbose:
+            print(f"provider={provider} tools={len(fleet.specs)} routing={args.routing}"
+                  + (f" skill={preloaded}" if preloaded else ""), file=sys.stderr)
+        answer = await dispatch(provider, fleet, system, args.task, usage, args)
+    if args.verbose:
+        print(usage.report(args.routing), file=sys.stderr)
     print(answer)
     return 0
 
@@ -471,14 +629,18 @@ async def connect(urls: List[str]):
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Drive a skill-router catalog (plus any domain MCP servers) "
-                    "from Claude or OpenAI.")
+                    "from Claude, OpenAI, OpenRouter or Gemini.")
     ap.add_argument("task", help="what you want done, in plain language")
-    ap.add_argument("--provider", choices=("claude", "openai"),
-                    help="default: whichever API key is set (ANTHROPIC first)")
+    ap.add_argument("--provider", choices=("claude", "openai", "openrouter", "gemini"),
+                    help="default: whichever API key is set (ANTHROPIC, then OPENAI, "
+                         "then OPENROUTER, then GEMINI)")
     ap.add_argument("--mode", choices=("local", "connector"), default="local",
                     help="local: we run the MCP client + tool loop.  connector: Claude connects to the MCP URL itself")
     ap.add_argument("--routing", choices=("model", "prefilter", "none"), default="model",
                     help="model: index in context, model calls get_skill (default).  prefilter: lexical shortlist first.  none: raw tools")
+    ap.add_argument("--compare-routing", action="store_true",
+                    help="run the task under model, prefilter AND none, then print a token "
+                         "table comparing them.  Costs 3 LLM calls, not 1; overrides --routing")
     ap.add_argument("--tool-search", action="store_true",
                     help="Claude only: server-side BM25 tool search + deferred tool schemas")
     ap.add_argument("--mcp-url", action="append", metavar="URL",
@@ -492,11 +654,23 @@ def main() -> int:
         print("USE_AI is not true — refusing to call an LLM.  Set USE_AI=true to opt in "
               "(this is the only script here that spends money).", file=sys.stderr)
         return 2
-    if args.mode == "connector" and pick_provider(args.provider) != "claude":
+    provider = pick_provider(args.provider)
+    if args.mode == "connector" and provider != "claude":
         print("--mode connector is Claude-only; OpenAI needs --mode local.", file=sys.stderr)
         return 2
-    if args.tool_search and pick_provider(args.provider) != "claude":
+    if args.tool_search and provider != "claude":
         print("--tool-search is Claude-only (server-side tool search).", file=sys.stderr)
+        return 2
+    if args.compare_routing and args.mode == "connector":
+        # run()'s connector branch returns before ever looking at compare_routing —
+        # reject here rather than silently running one strategy and calling it done.
+        print("--compare-routing needs --mode local; the connector path has no "
+              "per-strategy system prompt to compare.", file=sys.stderr)
+        return 2
+    # Before connecting, not after: a key missing at the far end of run() costs an MCP
+    # session and, under --routing prefilter, the routing calls it already spent.
+    if provider in PROVIDER_KEYS and not api_key_for(provider):
+        print(f"--provider {provider} needs {PROVIDER_KEYS[provider]} set", file=sys.stderr)
         return 2
 
     try:

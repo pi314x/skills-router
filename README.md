@@ -117,14 +117,61 @@ python llm_router.py "a coin just alerted at 6.2 — real or noise?"
 python llm_router.py --mcp-url http://127.0.0.1:8001/mcp \
                      --mcp-url http://127.0.0.1:9000/mcp "..."     # + a domain server
 python llm_router.py --provider openai --routing prefilter "..."
+python llm_router.py --provider openrouter "..."          # OPENROUTER_API_KEY, any model OpenRouter serves
+python llm_router.py --provider gemini "..."              # GEMINI_API_KEY, via Gemini's OpenAI-compat endpoint
 ```
 
-| | Claude | OpenAI |
-|---|---|---|
-| Tool shape | `{name, description, input_schema}` | `{type:"function", function:{…, parameters}}` |
-| Results | `tool_result` blocks, **all in one** user message | one `{role:"tool", tool_call_id}` message each |
-| Talks to MCP directly | yes — `mcp_servers` + `mcp_toolset` (`--mode connector`) | no; you run the client |
-| Server-side tool routing | yes — tool search + `defer_loading` | no; use tier 3 |
+| | Claude | OpenAI | OpenRouter | Gemini |
+|---|---|---|---|---|
+| Tool shape | `{name, description, input_schema}` | `{type:"function", function:{…, parameters}}` | same as OpenAI | same as OpenAI |
+| Results | `tool_result` blocks, **all in one** user message | one `{role:"tool", tool_call_id}` message each | same as OpenAI | same as OpenAI |
+| Talks to MCP directly | yes — `mcp_servers` + `mcp_toolset` (`--mode connector`) | no; you run the client | no; you run the client | no; you run the client |
+| Server-side tool routing | yes — tool search + `defer_loading` | no; use tier 3 | no; use tier 3 | no; use tier 3 |
+| Model | `CLAUDE_MODEL` | `OPENAI_MODEL` | `OPENROUTER_MODEL` — e.g. `anthropic/claude-opus-5`, `meta-llama/llama-3.1-70b-instruct` | `GEMINI_MODEL` — e.g. `gemini-flash-latest`, `gemini-2.5-pro` |
+
+OpenRouter and Gemini both speak the same Chat Completions API as OpenAI (Gemini via
+its own OpenAI-compatibility endpoint) — `run_openai` drives all three, each provider
+just supplying its own base URL, API key and model string, so there is no
+provider-specific request/response translation to write or test beyond that.
+
+`--verbose` reports what the run actually cost, per turn and as a total, so the
+tiers above can be compared rather than asserted:
+
+```
+  [0] tokens in=1204 out=88
+  [1] tokens in=1613 out=142
+tokens: in=2817 out=230 total=3047 turns=2 routing=prefilter
+```
+
+It goes to stderr — stdout still carries only the answer. Anthropic reports cache
+hits outside `input_tokens`, so those are added back in: `in=` is the size of the
+prompt that was actually sent, which is the number the tiers are arguing about.
+
+`--compare-routing` runs all three tiers back to back — same fleet, same task,
+same provider — and tables the totals instead of making you run it three times
+and diff the output by eye:
+
+```
+=== routing=model skill=triage-alert ===
+<answer>
+
+=== routing=prefilter skill=triage-alert ===
+<answer>
+
+=== routing=none ===
+<answer>
+
+routing         in     out   total  turns
+-----------------------------------------
+model         2817     230    3047      2
+prefilter     1904     180    2084      1
+none          3502     310    3812      3
+```
+
+It costs 3 LLM calls, not 1 — that is the deliberate trade for numbers that are
+actually comparable, since nothing else about the request changes between rows.
+`--mode connector` has no per-strategy system prompt to compare against, so the
+two flags are rejected together.
 
 ## Java build
 
@@ -141,7 +188,7 @@ identically.
 | `skills/*.md` | The catalog. Data, not code |
 | `skills.py` | Loader, validator, index, lexical router. **Stdlib only** — no MCP, no provider, no network |
 | `skill_server.py` | The MCP server (Python SDK 2.x): 3 tools, `skill://` resources, a `use_skill` prompt |
-| `llm_router.py` | Reference client — Claude or OpenAI, three routing strategies, many servers |
+| `llm_router.py` | Reference client — Claude, OpenAI, OpenRouter or Gemini, three routing strategies, many servers |
 | `java-mcp-server/` | The same server in Java/Spring Boot |
 | `tests/test_skills.py` | Offline. The six routing cases are acceptance criteria |
 | `docs/MCP_SERVER.md` | Transports, auth, TLS, Docker/systemd, per-client config |
