@@ -118,19 +118,21 @@ python llm_router.py --mcp-url http://127.0.0.1:8001/mcp \
                      --mcp-url http://127.0.0.1:9000/mcp "..."     # + a domain server
 python llm_router.py --provider openai --routing prefilter "..."
 python llm_router.py --provider openrouter "..."          # OPENROUTER_API_KEY, any model OpenRouter serves
+python llm_router.py --provider gemini "..."              # GEMINI_API_KEY, via Gemini's OpenAI-compat endpoint
 ```
 
-| | Claude | OpenAI | OpenRouter |
-|---|---|---|---|
-| Tool shape | `{name, description, input_schema}` | `{type:"function", function:{…, parameters}}` | same as OpenAI |
-| Results | `tool_result` blocks, **all in one** user message | one `{role:"tool", tool_call_id}` message each | same as OpenAI |
-| Talks to MCP directly | yes — `mcp_servers` + `mcp_toolset` (`--mode connector`) | no; you run the client | no; you run the client |
-| Server-side tool routing | yes — tool search + `defer_loading` | no; use tier 3 | no; use tier 3 |
-| Model | `CLAUDE_MODEL` | `OPENAI_MODEL` | `OPENROUTER_MODEL` — e.g. `anthropic/claude-opus-5`, `meta-llama/llama-3.1-70b-instruct` |
+| | Claude | OpenAI | OpenRouter | Gemini |
+|---|---|---|---|---|
+| Tool shape | `{name, description, input_schema}` | `{type:"function", function:{…, parameters}}` | same as OpenAI | same as OpenAI |
+| Results | `tool_result` blocks, **all in one** user message | one `{role:"tool", tool_call_id}` message each | same as OpenAI | same as OpenAI |
+| Talks to MCP directly | yes — `mcp_servers` + `mcp_toolset` (`--mode connector`) | no; you run the client | no; you run the client | no; you run the client |
+| Server-side tool routing | yes — tool search + `defer_loading` | no; use tier 3 | no; use tier 3 | no; use tier 3 |
+| Model | `CLAUDE_MODEL` | `OPENAI_MODEL` | `OPENROUTER_MODEL` — e.g. `anthropic/claude-opus-5`, `meta-llama/llama-3.1-70b-instruct` | `GEMINI_MODEL` — e.g. `gemini-flash-latest`, `gemini-2.5-pro` |
 
-OpenRouter speaks the same Chat Completions API as OpenAI — `run_openai` drives both,
-OpenRouter just supplies its own base URL, API key and model string, so there is no
-OpenRouter-specific request/response translation to write or test.
+OpenRouter and Gemini both speak the same Chat Completions API as OpenAI (Gemini via
+its own OpenAI-compatibility endpoint) — `run_openai` drives all three, each provider
+just supplying its own base URL, API key and model string, so there is no
+provider-specific request/response translation to write or test beyond that.
 
 ## Java build
 

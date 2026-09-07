@@ -7,7 +7,8 @@ Guidance for agents (and humans) working in this repo.
 An MCP server (`skill_server.py`) that serves *procedures* (skills, as Markdown
 files under `skills/`) rather than tools. `skills.py` is the stdlib-only loader,
 validator and lexical router — no network, no MCP, no LLM provider. `llm_router.py`
-is the reference client: it drives the catalog from Claude, OpenAI, or OpenRouter
+is the reference client: it drives the catalog from Claude, OpenAI, OpenRouter, or
+Gemini
 and is the only file here that spends money (gated behind `USE_AI=true`).
 
 ## Setup
@@ -35,10 +36,11 @@ regression, not a flaky test.
 
 ## Adding an LLM provider to llm_router.py
 
-- If the provider speaks the OpenAI Chat Completions API (OpenRouter, most
-  gateways do), reuse `run_openai` with a different `base_url`/`api_key`/`model`
-  rather than writing a new request/response translation — see `run_openrouter`
-  for the pattern.
+- If the provider speaks the OpenAI Chat Completions API (OpenRouter, Gemini via
+  its OpenAI-compat endpoint, most gateways do), reuse `run_openai` with a
+  different `base_url`/`api_key`/`model` rather than writing a new
+  request/response translation — see `run_openrouter`/`run_gemini` for the
+  pattern.
 - Only add real translation code (like `to_anthropic_tools`/`to_openai_tools`)
   for a genuinely different wire shape.
 - Wire the provider into `pick_provider` (env-var auto-detection) and the

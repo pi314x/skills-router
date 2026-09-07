@@ -45,6 +45,7 @@ here that spends money, so it stays off until you opt in.
                          --mcp-url http://127.0.0.1:9000/mcp "..."   # + a domain server
     python llm_router.py --provider openai --routing prefilter "..."
     python llm_router.py --provider openrouter "..."   # OPENROUTER_API_KEY; any model OpenRouter serves
+    python llm_router.py --provider gemini "..."       # GEMINI_API_KEY, via Gemini's OpenAI-compat endpoint
 """
 
 from __future__ import annotations
@@ -68,6 +69,8 @@ CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-5")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
 
 # The skill-routing tools are meta: they describe the catalog rather than the market.
 # Kept out of any deferred-loading set, because they are the entry point to everything
@@ -420,6 +423,19 @@ async def run_openrouter(fleet, specs, system: str, task: str, *, max_turns: int
                             model=OPENROUTER_MODEL, base_url=OPENROUTER_BASE_URL, api_key=api_key)
 
 
+async def run_gemini(fleet, specs, system: str, task: str, *, max_turns: int,
+                     verbose: bool) -> str:
+    """Gemini over its OpenAI-compatible endpoint — same reuse of run_openai as
+    OpenRouter above. See https://ai.google.dev/gemini-api/docs/openai for the
+    compatibility layer and https://ai.google.dev/gemini-api/docs/models for model
+    names (`GEMINI_MODEL`, e.g. `gemini-flash-latest`, `gemini-2.5-pro`)."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise SystemExit("--provider gemini needs GEMINI_API_KEY set")
+    return await run_openai(fleet, specs, system, task, max_turns=max_turns, verbose=verbose,
+                            model=GEMINI_MODEL, base_url=GEMINI_BASE_URL, api_key=api_key)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -433,6 +449,8 @@ def pick_provider(explicit: Optional[str]) -> str:
         return "openai"
     if os.getenv("OPENROUTER_API_KEY"):
         return "openrouter"
+    if os.getenv("GEMINI_API_KEY"):
+        return "gemini"
     return "claude"
 
 
@@ -470,6 +488,9 @@ async def run(args: argparse.Namespace) -> int:
         elif provider == "openrouter":
             answer = await run_openrouter(fleet, fleet.specs, system, args.task,
                                           max_turns=args.max_turns, verbose=args.verbose)
+        elif provider == "gemini":
+            answer = await run_gemini(fleet, fleet.specs, system, args.task,
+                                      max_turns=args.max_turns, verbose=args.verbose)
         else:
             answer = await run_openai(fleet, fleet.specs, system, args.task,
                                       max_turns=args.max_turns, verbose=args.verbose)
@@ -500,8 +521,9 @@ def main() -> int:
         description="Drive a skill-router catalog (plus any domain MCP servers) "
                     "from Claude or OpenAI.")
     ap.add_argument("task", help="what you want done, in plain language")
-    ap.add_argument("--provider", choices=("claude", "openai", "openrouter"),
-                    help="default: whichever API key is set (ANTHROPIC, then OPENAI, then OPENROUTER)")
+    ap.add_argument("--provider", choices=("claude", "openai", "openrouter", "gemini"),
+                    help="default: whichever API key is set (ANTHROPIC, then OPENAI, "
+                         "then OPENROUTER, then GEMINI)")
     ap.add_argument("--mode", choices=("local", "connector"), default="local",
                     help="local: we run the MCP client + tool loop.  connector: Claude connects to the MCP URL itself")
     ap.add_argument("--routing", choices=("model", "prefilter", "none"), default="model",

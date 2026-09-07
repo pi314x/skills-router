@@ -1,4 +1,4 @@
-"""Offline tests for llm_router.py's provider wiring — Claude, OpenAI, OpenRouter.
+"""Offline tests for llm_router.py's provider wiring — Claude, OpenAI, OpenRouter, Gemini.
 
 No network and no real API keys: every LLM call is replaced with a fake that just
 records what it was asked to send. The point is to prove the *wiring* is right —
@@ -35,7 +35,7 @@ def test_ai_enabled_defaults_off(monkeypatch):
 # ----------------------------------------------------------------- pick_provider
 
 def _clear_provider_env(monkeypatch):
-    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+    for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -50,6 +50,7 @@ def test_pick_provider_prefers_anthropic_first(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "a")
     monkeypatch.setenv("OPENAI_API_KEY", "b")
     monkeypatch.setenv("OPENROUTER_API_KEY", "c")
+    monkeypatch.setenv("GEMINI_API_KEY", "d")
     assert lr.pick_provider(None) == "claude"
 
 
@@ -57,13 +58,21 @@ def test_pick_provider_falls_back_to_openai(monkeypatch):
     _clear_provider_env(monkeypatch)
     monkeypatch.setenv("OPENAI_API_KEY", "b")
     monkeypatch.setenv("OPENROUTER_API_KEY", "c")
+    monkeypatch.setenv("GEMINI_API_KEY", "d")
     assert lr.pick_provider(None) == "openai"
 
 
 def test_pick_provider_falls_back_to_openrouter(monkeypatch):
     _clear_provider_env(monkeypatch)
     monkeypatch.setenv("OPENROUTER_API_KEY", "c")
+    monkeypatch.setenv("GEMINI_API_KEY", "d")
     assert lr.pick_provider(None) == "openrouter"
+
+
+def test_pick_provider_falls_back_to_gemini(monkeypatch):
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("GEMINI_API_KEY", "d")
+    assert lr.pick_provider(None) == "gemini"
 
 
 def test_pick_provider_defaults_to_claude_with_no_keys(monkeypatch):
@@ -163,6 +172,31 @@ def test_run_openrouter_requires_api_key(monkeypatch):
         asyncio.run(lr.run_openrouter(None, [], "sys", "task", max_turns=1, verbose=False))
 
 
+def test_run_gemini_targets_gemini_base_url_and_model(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-test")
+    recorder = {}
+    _fake_openai_client(monkeypatch, recorder)
+    result = asyncio.run(lr.run_gemini(None, [], "sys", "task", max_turns=1, verbose=False))
+    assert result == "ok"
+    assert recorder["init_kwargs"] == {"base_url": lr.GEMINI_BASE_URL, "api_key": "gem-test"}
+    assert recorder["create_kwargs"]["model"] == lr.GEMINI_MODEL
+
+
+def test_run_gemini_honors_model_override(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-test")
+    monkeypatch.setattr(lr, "GEMINI_MODEL", "gemini-2.5-pro")
+    recorder = {}
+    _fake_openai_client(monkeypatch, recorder)
+    asyncio.run(lr.run_gemini(None, [], "sys", "task", max_turns=1, verbose=False))
+    assert recorder["create_kwargs"]["model"] == "gemini-2.5-pro"
+
+
+def test_run_gemini_requires_api_key(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    with pytest.raises(SystemExit):
+        asyncio.run(lr.run_gemini(None, [], "sys", "task", max_turns=1, verbose=False))
+
+
 def test_run_openai_forwards_tool_calls_to_the_fleet(monkeypatch):
     """A tool_calls turn must reach fleet.call before the loop returns — this is
     the one piece of behavior OpenRouter reuses unmodified from the OpenAI path."""
@@ -207,12 +241,13 @@ def test_run_openai_forwards_tool_calls_to_the_fleet(monkeypatch):
 
 # ----------------------------------------------------------------- CLI plumbing
 
-def test_provider_flag_accepts_openrouter(monkeypatch, capsys):
+@pytest.mark.parametrize("provider", ["openrouter", "gemini"])
+def test_provider_flag_accepts_new_providers(monkeypatch, capsys, provider):
     monkeypatch.delenv("USE_AI", raising=False)
     monkeypatch.setattr(
-        "sys.argv", ["llm_router.py", "--provider", "openrouter", "some task"])
+        "sys.argv", ["llm_router.py", "--provider", provider, "some task"])
     # USE_AI is unset, so main() must reject *after* successfully parsing
-    # --provider openrouter — an invalid argparse choice would exit(2) earlier
+    # --provider <provider> — an invalid argparse choice would exit(2) earlier
     # with a "invalid choice" usage error instead of this message.
     assert lr.main() == 2
     assert "USE_AI" in capsys.readouterr().err
