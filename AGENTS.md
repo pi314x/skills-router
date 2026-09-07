@@ -52,6 +52,8 @@ regression, not a flaky test.
 - Every loop must `usage.record(resp, turn, verbose)` on each response, including
   ones it is about to discard or resend — they were billed. `token_counts`
   handles both usage shapes; extend it there, not in the loop.
+- A provider reachable from `dispatch()` is automatically covered by
+  `--compare-routing` (`run_compare`) too — don't special-case it there.
 
 ## Conventions
 

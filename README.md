@@ -147,6 +147,32 @@ It goes to stderr — stdout still carries only the answer. Anthropic reports ca
 hits outside `input_tokens`, so those are added back in: `in=` is the size of the
 prompt that was actually sent, which is the number the tiers are arguing about.
 
+`--compare-routing` runs all three tiers back to back — same fleet, same task,
+same provider — and tables the totals instead of making you run it three times
+and diff the output by eye:
+
+```
+=== routing=model skill=triage-alert ===
+<answer>
+
+=== routing=prefilter skill=triage-alert ===
+<answer>
+
+=== routing=none ===
+<answer>
+
+routing         in     out   total  turns
+-----------------------------------------
+model         2817     230    3047      2
+prefilter     1904     180    2084      1
+none          3502     310    3812      3
+```
+
+It costs 3 LLM calls, not 1 — that is the deliberate trade for numbers that are
+actually comparable, since nothing else about the request changes between rows.
+`--mode connector` has no per-strategy system prompt to compare against, so the
+two flags are rejected together.
+
 ## Java build
 
 [`java-mcp-server/`](java-mcp-server/README.md) is the same server on Spring Boot 4.1

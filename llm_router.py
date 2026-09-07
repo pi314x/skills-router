@@ -26,6 +26,10 @@ Three routing strategies (`--routing`), cheapest first:
              default, and the one that scales as the catalog grows.
   none       Raw tools, no skills. The baseline to compare the others against.
 
+`--compare-routing` runs the same task under all three, same fleet and provider, and
+prints a token table so you don't have to run it three times by hand and eyeball
+the difference.
+
 Two Claude-only transports worth knowing about (`--mode`):
 
   local      We are the MCP client and run the tool loop ourselves. Works on both
@@ -45,6 +49,7 @@ here that spends money, so it stays off until you opt in.
                          --mcp-url http://127.0.0.1:9000/mcp "..."   # + a domain server
     python llm_router.py --provider openai --routing prefilter "..."
     python llm_router.py --provider openrouter "..."   # OPENROUTER_API_KEY; any model OpenRouter serves
+    python llm_router.py --compare-routing "..."       # model vs prefilter vs none, one token table
     python llm_router.py --provider gemini "..."       # GEMINI_API_KEY, via Gemini's OpenAI-compat endpoint
 """
 
@@ -509,6 +514,55 @@ def pick_provider(explicit: Optional[str]) -> str:
     return "claude"
 
 
+async def dispatch(provider: str, fleet: "Fleet", system: str, task: str, usage: Usage,
+                   args: argparse.Namespace) -> str:
+    """Route to the one provider loop that matches `provider`.
+
+    The single place that decides which run_* a request reaches — shared by the
+    normal single-strategy run and by run_compare below, so there is exactly one
+    dispatch chain to keep in sync when a provider is added."""
+    if provider == "claude":
+        return await run_claude(fleet, fleet.specs, system, task, usage=usage,
+                                max_turns=args.max_turns, tool_search=args.tool_search,
+                                verbose=args.verbose)
+    if provider == "openrouter":
+        return await run_openrouter(fleet, fleet.specs, system, task, usage=usage,
+                                    max_turns=args.max_turns, verbose=args.verbose)
+    if provider == "gemini":
+        return await run_gemini(fleet, fleet.specs, system, task, usage=usage,
+                                max_turns=args.max_turns, verbose=args.verbose)
+    return await run_openai(fleet, fleet.specs, system, task, usage=usage,
+                            max_turns=args.max_turns, verbose=args.verbose)
+
+
+ROUTING_STRATEGIES = ("model", "prefilter", "none")
+
+
+async def run_compare(provider: str, fleet: "Fleet", args: argparse.Namespace) -> int:
+    """Run the same task under all three routing strategies and total each one.
+
+    Three real LLM calls, not one — `--compare-routing` costs 3x a normal run.  That
+    is the deliberate trade for a same-run, same-fleet, same-task comparison: the
+    numbers line up because nothing else about the request changed between rows."""
+    rows: List[Tuple[str, Usage]] = []
+    for routing in ROUTING_STRATEGIES:
+        system, preloaded = await build_system_prompt(fleet, args.task, routing)
+        usage = Usage()
+        answer = await dispatch(provider, fleet, system, args.task, usage, args)
+        rows.append((routing, usage))
+        print(f"=== routing={routing}" + (f" skill={preloaded}" if preloaded else "") + " ===")
+        print(answer)
+        print()
+
+    header = f"{'routing':<10} {'in':>7} {'out':>7} {'total':>7} {'turns':>6}"
+    print(header)
+    print("-" * len(header))
+    for routing, usage in rows:
+        print(f"{routing:<10} {usage.input:>7} {usage.output:>7} "
+              f"{usage.input + usage.output:>7} {usage.turns:>6}")
+    return 0
+
+
 async def run(args: argparse.Namespace) -> int:
     provider = pick_provider(args.provider)
     urls: List[str] = args.mcp_url or DEFAULT_MCP_URLS
@@ -528,30 +582,26 @@ async def run(args: argparse.Namespace) -> int:
         return 0
 
     async with connect(urls) as fleet:
-        system, preloaded = await build_system_prompt(fleet, args.task, args.routing)
         if args.verbose:
             for sess in fleet.sessions:
                 info = sess.server_info
                 print(f"connected {info.name} v{info.version} "
                       f"(protocol {sess.protocol_version})", file=sys.stderr)
-            print(f"provider={provider} tools={len(fleet.specs)} routing={args.routing}"
-                  + (f" skill={preloaded}" if preloaded else ""), file=sys.stderr)
         for name in fleet.collisions:
             print(f"warning: tool {name!r} served by more than one server — "
                   f"the first one listed wins", file=sys.stderr)
-        if provider == "claude":
-            answer = await run_claude(fleet, fleet.specs, system, args.task, usage=usage,
-                                      max_turns=args.max_turns,
-                                      tool_search=args.tool_search, verbose=args.verbose)
-        elif provider == "openrouter":
-            answer = await run_openrouter(fleet, fleet.specs, system, args.task, usage=usage,
-                                          max_turns=args.max_turns, verbose=args.verbose)
-        elif provider == "gemini":
-            answer = await run_gemini(fleet, fleet.specs, system, args.task, usage=usage,
-                                      max_turns=args.max_turns, verbose=args.verbose)
-        else:
-            answer = await run_openai(fleet, fleet.specs, system, args.task, usage=usage,
-                                      max_turns=args.max_turns, verbose=args.verbose)
+
+        if args.compare_routing:
+            if args.verbose:
+                print(f"provider={provider} tools={len(fleet.specs)} routing=compare",
+                      file=sys.stderr)
+            return await run_compare(provider, fleet, args)
+
+        system, preloaded = await build_system_prompt(fleet, args.task, args.routing)
+        if args.verbose:
+            print(f"provider={provider} tools={len(fleet.specs)} routing={args.routing}"
+                  + (f" skill={preloaded}" if preloaded else ""), file=sys.stderr)
+        answer = await dispatch(provider, fleet, system, args.task, usage, args)
     if args.verbose:
         print(usage.report(args.routing), file=sys.stderr)
     print(answer)
@@ -588,6 +638,9 @@ def main() -> int:
                     help="local: we run the MCP client + tool loop.  connector: Claude connects to the MCP URL itself")
     ap.add_argument("--routing", choices=("model", "prefilter", "none"), default="model",
                     help="model: index in context, model calls get_skill (default).  prefilter: lexical shortlist first.  none: raw tools")
+    ap.add_argument("--compare-routing", action="store_true",
+                    help="run the task under model, prefilter AND none, then print a token "
+                         "table comparing them.  Costs 3 LLM calls, not 1; overrides --routing")
     ap.add_argument("--tool-search", action="store_true",
                     help="Claude only: server-side BM25 tool search + deferred tool schemas")
     ap.add_argument("--mcp-url", action="append", metavar="URL",
@@ -607,6 +660,12 @@ def main() -> int:
         return 2
     if args.tool_search and provider != "claude":
         print("--tool-search is Claude-only (server-side tool search).", file=sys.stderr)
+        return 2
+    if args.compare_routing and args.mode == "connector":
+        # run()'s connector branch returns before ever looking at compare_routing —
+        # reject here rather than silently running one strategy and calling it done.
+        print("--compare-routing needs --mode local; the connector path has no "
+              "per-strategy system prompt to compare.", file=sys.stderr)
         return 2
     # Before connecting, not after: a key missing at the far end of run() costs an MCP
     # session and, under --routing prefilter, the routing calls it already spent.

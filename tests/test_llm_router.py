@@ -400,6 +400,21 @@ def test_blank_gateway_key_counts_as_missing(monkeypatch, capsys):
     assert "OPENROUTER_API_KEY" in capsys.readouterr().err
 
 
+def test_compare_routing_rejected_with_connector_mode(monkeypatch, capsys):
+    """run()'s connector branch returns before ever consulting compare_routing —
+    silently running one strategy under --compare-routing would be worse than
+    refusing, since the output looks like a comparison but isn't one."""
+    monkeypatch.setenv("USE_AI", "true")
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    _no_dial_out(monkeypatch)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["llm_router.py", "--compare-routing", "--mode", "connector", "some task"])
+    assert lr.main() == 2
+    assert "--compare-routing" in capsys.readouterr().err
+
+
 # ----------------------------------------------------------------- run() dispatch
 
 @pytest.mark.parametrize("provider,expected", [
@@ -435,11 +450,58 @@ def test_run_dispatches_to_the_right_provider(monkeypatch, capsys, provider, exp
         monkeypatch.setattr(lr, name, recorder(name))
 
     args = argparse.Namespace(
-        provider=provider, mode="local", routing="model", task="some task",
-        mcp_url=None, max_turns=1, tool_search=False, verbose=False)
+        provider=provider, mode="local", routing="model", compare_routing=False,
+        task="some task", mcp_url=None, max_turns=1, tool_search=False, verbose=False)
     assert asyncio.run(lr.run(args)) == 0
     assert called == [expected]
     assert capsys.readouterr().out.strip() == "answer"
+
+
+def test_compare_routing_runs_all_three_strategies_and_tables_the_totals(monkeypatch, capsys):
+    """--compare-routing must build a fresh prompt per strategy (so each gets its
+    own routing decision, not the same one three times) and report every one's
+    cost, not just the last."""
+    @asynccontextmanager
+    async def fake_connect(urls):
+        yield SimpleNamespace(specs=[], collisions=[], sessions=[])
+
+    seen_routings = []
+
+    async def fake_build_system_prompt(fleet, task, routing):
+        seen_routings.append(routing)
+        skill = "triage-alert" if routing == "prefilter" else None
+        return f"sys-for-{routing}", skill
+
+    # Distinct, easily-checked token counts per routing so a wrong row is obvious.
+    costs = {"model": (1000, 100), "prefilter": (400, 50), "none": (2000, 200)}
+
+    async def fake_run_openai(fleet, specs, system, task, *, usage, **_kw):
+        routing = system.removeprefix("sys-for-")
+        inp, out = costs[routing]
+        usage.record(SimpleNamespace(usage=SimpleNamespace(prompt_tokens=inp,
+                                                            completion_tokens=out)),
+                     turn=0, verbose=False)
+        return f"answer-for-{routing}"
+
+    monkeypatch.setattr(lr, "connect", fake_connect)
+    monkeypatch.setattr(lr, "build_system_prompt", fake_build_system_prompt)
+    monkeypatch.setattr(lr, "run_openai", fake_run_openai)
+
+    args = argparse.Namespace(
+        provider="openai", mode="local", routing="model", compare_routing=True,
+        task="some task", mcp_url=None, max_turns=1, tool_search=False, verbose=False)
+    assert asyncio.run(lr.run(args)) == 0
+
+    assert seen_routings == ["model", "prefilter", "none"]
+    out = capsys.readouterr().out
+    for routing in ("model", "prefilter", "none"):
+        assert f"answer-for-{routing}" in out
+    assert "skill=triage-alert" in out          # only prefilter's section names one
+    lines = {line.split()[0]: line for line in out.splitlines()
+            if line.split()[:1] and line.split()[0] in costs}
+    assert lines["model"].split()[1:] == ["1000", "100", "1100", "1"]
+    assert lines["prefilter"].split()[1:] == ["400", "50", "450", "1"]
+    assert lines["none"].split()[1:] == ["2000", "200", "2200", "1"]
 
 
 def test_run_reports_the_token_total_when_verbose(monkeypatch, capsys):
@@ -464,8 +526,8 @@ def test_run_reports_the_token_total_when_verbose(monkeypatch, capsys):
 
     def call(verbose):
         args = argparse.Namespace(
-            provider="openai", mode="local", routing="prefilter", task="some task",
-            mcp_url=None, max_turns=1, tool_search=False, verbose=verbose)
+            provider="openai", mode="local", routing="prefilter", compare_routing=False,
+            task="some task", mcp_url=None, max_turns=1, tool_search=False, verbose=verbose)
         assert asyncio.run(lr.run(args)) == 0
         return capsys.readouterr()
 
